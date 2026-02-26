@@ -1,0 +1,26 @@
+# @package _global_
+defaults:
+  - /experiment/slot_attention/_base_large
+  - /dataset: movi_c_image
+  - /experiment/slot_attention/_preprocessing_movi
+  - /experiment/slot_attention/_metrics_clevr
+  - _self_
+
+trainer:
+  devices: 4
+  max_steps: 500000
+  max_epochs:
+  gradient_clip_val: 1.0
+
+dataset:
+  num_workers: 4
+  batch_size: 8
+
+models:
+  conditioning:
+    _target_: routed.ocl.conditioning.RandomConditioning
+    object_dim: 256
+    n_slots: 11
+    batch_size_path: input.batch_size
+
+load_checkpoint: /scratch/wz3008/new_SlotAttn/object-centric-learning-framework/outputs/slot_attention/movi_c/2026-02-10_19-54-24/lightning_logs/version_1893027/checkpoints/epoch=3-step=29444.ckpt
