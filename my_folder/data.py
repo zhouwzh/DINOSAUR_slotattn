@@ -1,4 +1,3 @@
-#test
 # {"video_idx", "frame_idx", "instance_idx", "image_path", "movi_mask_path", "selected_slot_idx", "slot_feat_path", "slot_mask_path", "caption"}
 import json
 import random
@@ -43,7 +42,7 @@ class SlotCaptionDataset(Dataset):
         self.unk = self.vocab["<unk>"]
         self.max_seq_len = 25
         self.word_seq_len = 4   # default 4 words for each capton
-        self.Mmax = 10
+        self.Mmax = 2
 
         self._tok_cache: Dict[str, Tuple[List[int], int]] = {}
         self._word_tok_cache: Dict[str, List[int]] = {}
@@ -81,14 +80,15 @@ class SlotCaptionDataset(Dataset):
         n_val_start = int(n_total * 0.9)
 
         if args.dev:
-            n_train = int(n_total * 0.0001)
-            n_val_start = int(n_total * 0.9999)
+            n_train = int(n_total * 0.01)
+            n_val_start = int(n_total * 0.99)
             print(f"dev mode, use less data. n_total={n_total}, n_train={n_train}, n_val_start={n_val_start}")
 
-        self.train_frame_keys = self.all_frame_keys[:n_train]
+        raw_train_frame_keys = self.all_frame_keys[:n_train]
         self.val_frame_keys = self.all_frame_keys[n_val_start:]
 
         if self.split == "train":
+            self.train_frame_keys = self._build_interleaved_train_keys(raw_train_frame_keys, seed=args.seed)
             self.frame_keys = self.train_frame_keys
         elif self.split == "val":
             self.valdata_preprocess()
@@ -97,6 +97,38 @@ class SlotCaptionDataset(Dataset):
         else:
             raise ValueError(f"split must be 'train' or 'val', got {self.split}")
 
+    def _build_interleaved_train_keys(self, frame_keys, seed=42):
+        """
+        train frame keys, group in video, interleaved arrange
+        Let adjacent samples come from different videos.
+        """
+        rng = random.Random(seed)
+
+        # video_idx -> list[(video_idx, frame_idx)]
+        video_to_keys = {}
+        for key in frame_keys:
+            video_idx = int(key[0])
+            video_to_keys.setdefault(video_idx, []).append(key)
+
+        # 每个视频内部打乱
+        for video_idx in video_to_keys:
+            rng.shuffle(video_to_keys[video_idx])
+
+        # 视频顺序打乱
+        video_ids = list(video_to_keys.keys())
+        rng.shuffle(video_ids)
+
+        # round-robin 
+        interleaved = []
+        still_has_data = True
+        while still_has_data:
+            still_has_data = False
+            for video_idx in video_ids:
+                if len(video_to_keys[video_idx]) > 0:
+                    interleaved.append(video_to_keys[video_idx].pop())
+                    still_has_data = True
+
+        return interleaved
     # ======================================================
     # tokenization
     # ======================================================
