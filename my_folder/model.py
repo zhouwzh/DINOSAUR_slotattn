@@ -56,7 +56,7 @@ class TransformerLayer(nn.Module):
         h = self.norm1(x)
         attn_out, attn_weights = self.attn(
             h, h, h,
-            key_padding_mask=None,             #key_padding_mask,
+            # key_padding_mask=key_padding_mask,
             need_weights=return_attn,
         )
         
@@ -116,8 +116,16 @@ class SlotTextModel(nn.Module):
             
         self.max_text_len = 4
         
-        self.pos_emb = nn.Parameter(
-            torch.randn(1, 1 + self.max_text_len + self.max_slots, embed_dim)
+        # self.pos_emb = nn.Parameter(
+        #     torch.randn(1, 1 + self.max_text_len + self.max_slots, embed_dim)
+        # )
+
+        self.text_pos_emb = nn.Parameter(
+            torch.randn(1, 1 + self.max_text_len, embed_dim)   # CLS + text
+        )
+
+        self.vision_pos_emb = nn.Parameter(
+            torch.randn(1, self.max_slots, embed_dim)          # only for vit side
         )
         
         self.tf_encoder = TransformerLayer(
@@ -161,6 +169,31 @@ class SlotTextModel(nn.Module):
     @staticmethod
     def _l2norm(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         return x / (x.norm(dim=-1, keepdim=True) + eps)
+    
+    def _build_input_sequence(
+        self,
+        cls_tok: torch.Tensor,   # [B, 1, D]
+        txt: torch.Tensor,       # [B, Ltxt, D]
+        z_vis: torch.Tensor,     # [B, K, D]
+    ) -> torch.Tensor:
+        """
+        Build transformer input:
+        - CLS + text always get positional embeddings
+        - visual tokens get pos emb only when self.use_vit == True
+        """
+        B, Ltxt, D = txt.shape
+        K = z_vis.shape[1]
+
+        txt_part = torch.cat([cls_tok, txt], dim=1)  # [B, 1+Ltxt, D]
+        txt_part = txt_part + self.text_pos_emb[:, : 1 + Ltxt, :]
+
+        if self.use_vit:
+            vis_part = z_vis + self.vision_pos_emb[:, :K, :]
+        else:
+            vis_part = z_vis
+
+        x = torch.cat([txt_part, vis_part], dim=1)   # [B, 1+Ltxt+K, D]
+        return x
     
     def _run_oclf(self, input_dict: dict):
         """
@@ -364,8 +397,13 @@ class SlotTextModel(nn.Module):
     
                 cls = self.cls_token.expand(M, 1, D)          # [M, 1, D]
                 z_rep = z_j.unsqueeze(0).expand(M, K, D)      # [M, K, D]
-                x = torch.cat([cls, t_i, z_rep], dim=1)       # [M, 1+4+K, D]
-                x = x + self.pos_emb[:, : (1 + Ltxt + K), :]
+                x = self._build_input_sequence(
+                    cls_tok=cls,
+                    txt=t_i,
+                    z_vis=z_rep,
+                )
+                # x = torch.cat([cls, t_i, z_rep], dim=1)       # [M, 1+4+K, D]
+                # x = x + self.pos_emb[:, : (1 + Ltxt + K), :]
     
                 key_padding_mask = None
                 if slot_mask is not None:
@@ -428,8 +466,13 @@ class SlotTextModel(nn.Module):
         txt = t_emb[:, 0]                                       # [4, 4, D]
                 
         cls_tok = self.cls_token.expand(B, 1, D)                 # [4, 1, D]
-        x = torch.cat([cls_tok, txt, z_slots], dim=1)                              # [4, 1+4+K, D]
-        x = x + self.pos_emb[:, :x.shape[1], :]                                # broadcast to [4, 1+4+K, D]
+        # x = torch.cat([cls_tok, txt, z_slots], dim=1)                              # [4, 1+4+K, D]
+        # x = x + self.pos_emb[:, :x.shape[1], :]                                # broadcast to [4, 1+4+K, D]
+        x = self._build_input_sequence(
+            cls_tok=cls_tok,
+            txt=txt,
+            z_vis=z_slots,
+        )
 
         key_padding_mask = None
         if slot_mask is not None:
@@ -440,7 +483,7 @@ class SlotTextModel(nn.Module):
                 repeat_n=None,
             )  # [4, 1+4+K]
             
-        h = self.tf_encoder(x, key_padding_mask=key_padding_mask)                                                 # [4, 1+4+K, D]
+        h = self.tf_encoder(x, key_padding_mask=key_padding_mask)              # [4, 1+4+K, D]
         scores = self.match_head(h[:, 0, :]).squeeze(-1)                       # [4]
 
         return scores
@@ -464,8 +507,13 @@ class SlotTextModel(nn.Module):
         txt = t_emb[:, 0]                                   # [4, 4, D]
 
         cls_tok = self.cls_token.expand(B, 1, D)            # [4, 1, D]
-        x = torch.cat([cls_tok, txt, z_slots], dim=1)       # [4, 1+4+K, D]
-        x = x + self.pos_emb[:, :x.shape[1], :]
+        # x = torch.cat([cls_tok, txt, z_slots], dim=1)       # [4, 1+4+K, D]
+        # x = x + self.pos_emb[:, :x.shape[1], :]
+        x = self._build_input_sequence(
+            cls_tok=cls_tok,
+            txt=txt,
+            z_vis=z_slots,
+        )
 
         key_padding_mask = None
         if slot_mask is not None:
@@ -507,11 +555,15 @@ class SlotTextModel(nn.Module):
                 z_slots=z_slots,
                 slot_mask=slot_mask,
             )
+
+            vis_masks = self.get_eval_visual_masks(input_dict)
+
             return {
-                "scores": scores,
-                "cls_attn": cls_attn,
-                "z_slots": z_slots,
-                "slot_mask": slot_mask,
+                "scores": scores,         # [4]
+                "cls_attn": cls_attn,     # [4, 1+4+K]
+                "z_slots": z_slots,       # [4, K, D]
+                "slot_mask": slot_mask,   # [4, K] or None
+                "vis_masks": vis_masks,   # [4, K, 1, H, W] or None
             }
     
         if mode == "val":
@@ -544,6 +596,47 @@ class SlotTextModel(nn.Module):
             slot_mask=slot_mask,
         )
         return loss
+    
+    def visualize_steve(self, images, tau=0.1, hard=True):
+        if self.steve_model is None:
+            raise RuntimeError("STEVE is not enabled")
+        with torch.no_grad():
+            video = images.unsqueeze(1)  # [B, 1, C, H, W]
+            recon_dvae, _, _, attns_vis = self.steve_model(video, tau=tau, hard=hard)
+            recon_tf = self.steve_model.reconstruct_autoregressive(video)
+        return video, recon_dvae, recon_tf, attns_vis
+
+    def get_eval_visual_masks(self, input_dict: dict):
+        """
+        Returns:
+            vis_masks: [B, K, 1, H, W] or None
+        """
+        # 1) if precomputed slot masks are available, use them directly
+        if self.pre_slot_mask and "pre_slot_mask" in input_dict:
+            vis_masks = input_dict["pre_slot_mask"].float()   # [B, K, 1, H, W]
+            if vis_masks.dim() == 4:
+                vis_masks = vis_masks.unsqueeze(2)
+            return vis_masks
+
+        # 2) STEVE branch: use STEVE attention visualization as soft slot masks
+        if self.steve:
+            with torch.no_grad():
+                _, attns_vis, _ = self.steve_model.encode(input_dict["image"].unsqueeze(1))
+                # attns_vis expected: [B, 1, K, C, H, W]
+                if attns_vis.dim() == 6:
+                    vis_masks = attns_vis[:, 0].mean(dim=2, keepdim=True)   # [B, K, 1, H, W]
+                else:
+                    vis_masks = None
+            return vis_masks
+
+        # 3) OCL branch: use object decoder masks
+        out = self._run_oclf(input_dict)
+        vis_masks = out["object_decoder"].masks
+        # could be [B, K, H, W] or [B, K, 1, H, W]
+        if vis_masks.dim() == 4:
+            vis_masks = vis_masks.unsqueeze(2)
+        return vis_masks.float()
+                    
         
         
 
