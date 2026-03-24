@@ -8,6 +8,10 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import *
+import random
+import numpy as np
+import torchvision.utils as vutils
+import matplotlib.pyplot as plt
 
 from model import SlotTextModel
 from textmodel import TextEncoder
@@ -17,11 +21,186 @@ from get_oclf_model_demo import build_oclf_model_same_arch, MOVIA_LABEL_PREFIX
 from ocl.datasets import _get_single_element_transforms
 from ocl.datasets import _get_batch_transforms
 
+def _to_img_np(x):
+    # x: [C,H,W]
+    x = x.detach().cpu().clamp(0, 1)
+    return x.permute(1, 2, 0).numpy()
+
+def _to_mask_np(x):
+    # x: [1,H,W] or [H,W]
+    x = x.detach().cpu()
+    if x.dim() == 3:
+        x = x.squeeze(0)
+    x = x.float()
+    if x.max() > 0:
+        x = x / x.max()
+    return x.numpy()
+
+def visualize_steve(args, model, train_loader):
+    if not args.steve:
+        raise RuntimeError("visualize_steve() currently only supports --steve")
+    model.eval()
+    save_root = Path("/scratch/wz3008/new_SlotAttn/object-centric-learning-framework/my_folder/visualization")
+    save_root.mkdir(parents=True, exist_ok=True)
+    max_batches = getattr(args, "visualize_batches", 10)
+    n_show = getattr(args, "visualize_n", 8)
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(train_loader):
+            input_dict = build_train_input(batch, args)
+            images = input_dict["image"]   # [B, C, H, W]
+            video, recon_dvae, recon_tf, attns_vis = model.visualize_steve(images,tau=0.1,hard=True,)
+            # video:      [B, 1, C, H, W]
+            # recon_dvae: [B, 1, C, H, W]
+            # recon_tf:   [B, 1, C, H, W]
+            # attns_vis:  [B, 1, K, C, H, W]
+            B, T, C, H, W = video.shape
+            N = min(n_show, B)    
+            for t in range(T):
+                video_t = video[:N, t, None, :, :, :]
+                recon_dvae_t = recon_dvae[:N, t, None, :, :, :]
+                recon_tf_t = recon_tf[:N, t, None, :, :, :]
+                attns_t = attns_vis[:N, t, :, :, :, :]
+
+                tiles = torch.cat((video_t, recon_dvae_t, recon_tf_t, attns_t),dim=1).flatten(end_dim=1)
+                frame = vutils.make_grid(tiles,nrow=(model.steve_model.num_slots + 3),pad_value=0.8,)
+
+                out_path = save_root / f"train_batch{batch_idx:04d}_frame{t:02d}.png"
+                vutils.save_image(frame, out_path)
+
+            print(f"[visualize] saved batch {batch_idx} to {save_root}")
+
+            if batch_idx + 1 >= max_batches:
+                break
+
+def visualize_eval(args, model, val_loader):
+    model.eval()
+
+    save_root = Path("/scratch/wz3008/new_SlotAttn/object-centric-learning-framework/my_folder/visualization/val_vis")
+    save_root.mkdir(parents=True, exist_ok=True)
+
+    max_samples = 50
+    text_len = 4
+    cls_offset = 1
+    slot_start = cls_offset + text_len   # CLS + 4 text tokens
+
+    with torch.no_grad():
+        for sample_idx, batch in enumerate(val_loader):
+            if sample_idx >= max_samples:
+                break
+
+            input_dict, target_index = build_val_input(batch, args)
+            out = model(input_dict, mode="val_vis")
+
+            scores = out["scores"].detach().cpu()           # [4]
+            cls_attn = out["cls_attn"].detach().cpu()       # [4, 1+4+K]
+            slot_mask = out["slot_mask"]
+            vis_masks = out["vis_masks"]                    # [4,K,1,H,W] or None
+
+            if slot_mask is not None:
+                slot_mask = slot_mask.detach().cpu()
+            if vis_masks is not None:
+                vis_masks = vis_masks.detach().cpu()
+
+            images = batch["images"].squeeze(0).detach().cpu()           # [4,C,H,W]
+            contains_target = batch["contains_target"].squeeze(0).cpu()  # [4]
+            pred_index = int(scores.argmax().item())
+
+            if pred_index != target_index:
+                continue
+
+            target_caption = batch["target_label"][0]
+            # batch_size=1 时 target_label 会被 DataLoader 包成长度1的 list
+
+            # fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+            # axes = axes.flatten()
+            fig, axes = plt.subplots(4, 2, figsize=(10, 18))
+
+            for i in range(4):
+                ax_img = axes[i, 0]
+                ax_mask = axes[i, 1]
+
+                img_np = _to_img_np(images[i])
+
+                cur_score = float(scores[i].item())
+                is_pos = int(contains_target[i].item())
+
+                cur_attn = cls_attn[i]              # [1+4+K]
+                slot_attn = cur_attn[slot_start:]   # [K]
+
+                if slot_mask is not None:
+                    valid_mask = slot_mask[i].bool()
+                    masked_slot_attn = slot_attn.clone()
+                    masked_slot_attn[~valid_mask] = -1e9
+                    best_slot_idx = int(masked_slot_attn.argmax().item())
+                    best_slot_attn = float(masked_slot_attn[best_slot_idx].item())
+                else:
+                    best_slot_idx = int(slot_attn.argmax().item())
+                    best_slot_attn = float(slot_attn[best_slot_idx].item())
+
+                tags = []
+                if i == target_index:
+                    tags.append("GT")
+                if i == pred_index:
+                    tags.append("PRED")
+                if is_pos == 1:
+                    tags.append("POS")
+                else:
+                    tags.append("NEG")
+
+                title = (
+                    f"img {i} | match_score={cur_score:.4f}\n"
+                    f"top_slot={best_slot_idx} | cls->slot_attn={best_slot_attn:.4f}\n"
+                    f"{' | '.join(tags)}"
+                )
+
+                # 左边：原图
+                ax_img.imshow(img_np)
+                ax_img.axis("off")
+                ax_img.set_title(title, fontsize=10)
+
+                # 右边：mask
+                if vis_masks is not None:
+                    best_mask = vis_masks[i, best_slot_idx]   # [1,H,W]
+                    mask_np = _to_mask_np(best_mask)
+                    ax_mask.imshow(mask_np, cmap="jet", alpha=0.35 * (mask_np > 0.1))
+                else:
+                    ax_mask.text(0.5, 0.5, "No mask", ha="center", va="center", fontsize=14)
+
+                ax_mask.axis("off")
+                ax_mask.set_title(f"img {i} top-slot mask", fontsize=10)
+
+                if i == pred_index:
+                    for spine in ax_img.spines.values():
+                        spine.set_visible(True)
+                        spine.set_edgecolor("red")
+                        spine.set_linewidth(4)
+
+                elif i == target_index:
+                    for spine in ax_img.spines.values():
+                        spine.set_visible(True)
+                        spine.set_edgecolor("lime")
+                        spine.set_linewidth(4)
+
+            fig.suptitle(
+                f"val sample {sample_idx:04d}\n"
+                f"target_caption: {target_caption}",
+                fontsize=14
+            )
+            fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+            out_path = save_root / f"val_sample_{sample_idx:04d}.png"
+            fig.savefig(out_path, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+
+            print(f"[visualize_eval] saved {out_path}")
+
 class SimpleLogger:
-    def __init__(self, mode: str, logdir: Path):
+    def __init__(self, mode: str, logdir: Path, run_name: str):
         self.mode = mode
         self.logdir = Path(logdir)
         self.logdir.mkdir(parents=True, exist_ok=True)
+        self.run_name = run_name
+
 
         self.tb_writer = None
         self.txt_file = None
@@ -29,7 +208,7 @@ class SimpleLogger:
         if self.mode == "tensorboard":
             self.tb_writer = SummaryWriter(self.logdir)
         elif self.mode == "txt":
-            self.txt_file = self.logdir / "train_log.txt"
+            self.txt_file = self.logdir / f"{self.run_name}_train_log.txt"
             with open(self.txt_file, "a", encoding="utf-8") as f:
                 f.write("===== training log start =====\n")
         else:
@@ -58,10 +237,12 @@ def build_run_name(args) -> str:
         return (f"dev_{ts}")
     return (
         f"{ts}"
+        f"_steve-{int(args.steve)}"
         f"_vit-{int(args.vit)}"
         f"_preslot-{int(args.pre_slot_feature)}"
         f"_tp-{args.train_percent}"
         f"_criterion-{args.criterion}"
+        f"_seed-{args.seed}"
     )
 
 # =========================================================
@@ -119,6 +300,16 @@ def build_val_input(batch, args):
     input_dict = batch_to_cuda(input_dict)
     return input_dict, target_index
 
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 # =========================================================
 # evaluation
 # =========================================================
@@ -168,25 +359,61 @@ def save_checkpoint(path: Path, epoch: int, global_step: int, model, opt, args):
     }
     torch.save(ckpt, path)
 
+def load_resume_ckpt(ckpt_path: str):
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    print(f"[resume] checkpoint loaded from {ckpt_path}")
+    print(f"[resume] keys: {list(ckpt.keys())}")
+    return ckpt
+
+def resume_training(model, opt, ckpt_path: str, strict: bool = True):
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+
+    msg = model.load_state_dict(ckpt["model"], strict=strict)
+    opt.load_state_dict(ckpt["opt"])
+
+    start_epoch = ckpt.get("epoch", -1) + 1
+    global_step = ckpt.get("global_step", 0)
+
+    print(f"[resume] loaded from {ckpt_path}")
+    print(f"[resume] strict={strict}")
+    print(f"[resume] start_epoch={start_epoch}")
+    print(f"[resume] global_step={global_step}")
+    print(f"[resume] missing_keys={msg.missing_keys}")
+    print(f"[resume] unexpected_keys={msg.unexpected_keys}")
+
+    return start_epoch, global_step
+
 # =========================================================
 # train
 # =========================================================
-def train(args, model, train_loader, val_loader):
+def train(args, model, train_loader, val_loader, resume_ckpt=None):
+
     run_name = build_run_name(args)
+    print(f"Run name: {run_name}")
     logdir = Path(args.logdir) / run_name
     logdir.mkdir(parents=True, exist_ok=True)
-    logger = SimpleLogger(args.writer_type, logdir)
+    logger = SimpleLogger(args.writer_type, logdir, run_name)
 
-    global_step = 0
-    best_val = math.inf
-    best_acc = 0.0
+    # global_step = 0
+    # best_val = math.inf
+    # best_acc = 0.0
 
     opt = torch.optim.AdamW(
         (p for p in model.parameters() if p.requires_grad),
         lr=args.lr,
         weight_decay=args.wd,
     )
+    
+    start_epoch = 0
+    global_step = 0
+    best_acc = 0.0
+    if resume_ckpt is not None:
+        opt.load_state_dict(resume_ckpt["opt"])
+        start_epoch = resume_ckpt.get("epoch", -1) + 1
+        global_step = resume_ckpt.get("global_step", 0)
 
+        print(f"[resume] start_epoch={start_epoch}")
+        print(f"[resume] global_step={global_step}")
     # -----------------------------------------------------
     # evaluate with scratch model
     # -----------------------------------------------------
@@ -199,11 +426,12 @@ def train(args, model, train_loader, val_loader):
         epoch=0,
         prefix="val_scratch",
     )
+    best_acc = scratch_metrics["acc_i2t_top1"]
 
     # -----------------------------------------------------
     # main training loop
     # -----------------------------------------------------
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         t0 = time.time()
 
@@ -263,10 +491,15 @@ def train(args, model, train_loader, val_loader):
     print("Training completed.")
 
 def main(args):
+    set_seed(args.seed)
+    g  = torch.Generator()
+    g.manual_seed(args.seed)
+    
     dm, lm = build_oclf_model_same_arch(
         args.train_config_path,
         args.checkpoint_path,
     )
+    # dm, lm = None, None
 
     if args.use_original_data:
         train_dataset = dm._create_webdataset(
@@ -319,17 +552,18 @@ def main(args):
 
         val_dataset.check_val_metadata()
 
-        if args.pre_slot_feature:
-            train_dataset.preload_all_feats()
-            val_dataset.preload_all_feats()
+        # if args.pre_slot_feature:
+        #     train_dataset.preload_all_feats()
+        #     val_dataset.preload_all_feats()
 
         train_loader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            shuffle=True,
+            shuffle=False,
             num_workers=args.num_workers,
             pin_memory=True,
             drop_last=False,
+            generator=g,
         )
 
         val_loader = DataLoader(
@@ -350,19 +584,29 @@ def main(args):
         textencoder=textencoder,
     ).to(device)
 
-    print(f"=============== Start {args.train_percent} percent train ===============")
-    print(f"train data num: {len(train_dataset)}, val data num: {len(val_dataset)}")
+    resume_ckpt = None
+    if args.resume_path:
+        resume_ckpt = load_resume_ckpt(args.resume_path)
+        msg = model.load_state_dict(resume_ckpt["model"], strict=True)
+        print(f"[resume] model weights loaded in main()")
+        print(f"[resume] missing_keys={msg.missing_keys}")
+        print(f"[resume] unexpected_keys={msg.unexpected_keys}")
+        print(f"=============== Start {args.train_percent} percent train ===============")
+        print(f"train data num: {len(train_dataset)}, val data num: {len(val_dataset)}")
 
     if args.visualize:
-        visualize(args, model, val_loader)
+        # if args.steve:
+        #     visualize_steve(args, model, train_loader)
+        visualize_eval(args, model, val_loader)
+        return       
 
-    train(args, model, train_loader, val_loader)
+    train(args, model, train_loader, val_loader,resume_ckpt=resume_ckpt)
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
 
-    p.add_argument("--data-root", type=str, default="/output")
-    p.add_argument("--vocab-path", type=str, default="/scratch/wz3008/new_SlotAttn/slot_attn_new/vocab.json")
+    p.add_argument("--data_root", type=str, default="/output")
+    p.add_argument("--vocab_path", type=str, default="/scratch/wz3008/new_SlotAttn/slot_attn_new/vocab.json")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--cpu", action="store_true")
@@ -374,9 +618,9 @@ if __name__ == "__main__":
     )
     p.add_argument("--writer_type", type=str, default="tensorboard", choices=["tensorboard", "txt"])
 
-    p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--wd", type=float, default=1e-4)
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--wd", type=float, default=1e-5)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--log-every", type=int, default=1)
     p.add_argument("--val-every", type=int, default=1)
@@ -404,8 +648,13 @@ if __name__ == "__main__":
     p.add_argument("--vit_patches", action="store_true")
     p.add_argument("--steve", action="store_true")
     p.add_argument("--criterion", type=str, default="")
+    p.add_argument("--seed", type=int, default=42)
     
     p.add_argument("--val_metadata_path", type=str, default="/scratch/wz3008/new_SlotAttn/object-centric-learning-framework/my_folder/val_metadata.json")
+
+    p.add_argument("--resume_path", type=str, default="")   #xxx.pth
+    # p.add_argument("--load_model_path", type=str, default="")
+    # p.add_argument("--strict_load", action="store_true")
 
     args = p.parse_args()
 
